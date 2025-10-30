@@ -1,40 +1,39 @@
 import Foundation
 @preconcurrency import FoundationDB
 import Logging
+import Synchronization
 
 /// Primary interface for ontology management
 ///
-/// Note: Swift 6 Concurrency Compatibility
-/// This actor uses `nonisolated(unsafe)` for the database property because
-/// FoundationDB's TransactionProtocol is not yet Sendable-compliant.
-/// The design is safe because:
-/// 1. Actor isolation protects all mutable state
-/// 2. Database operations are properly sequenced through withTransaction
-/// 3. No shared mutable state escapes actor boundaries
-/// Future: When FoundationDB adopts Swift 6 concurrency, remove nonisolated(unsafe)
-public actor OntologyStore {
+/// Thread safety is provided by:
+/// - Swift Synchronization.Mutex for cache access (~1μs overhead vs ~10μs for actor)
+/// - FoundationDB transaction model for database operations
+public final class OntologyStore: @unchecked Sendable {
 
     // MARK: - Properties
 
-    // Note: nonisolated(unsafe) used due to FoundationDB's non-Sendable protocols
-    // This is safe because all database operations are actor-isolated
     nonisolated(unsafe) let database: any DatabaseProtocol
     let rootPrefix: String
     let logger: Logger
 
-    // Caching (LRU)
-    private var classCache: [String: OntologyClass] = [:]
-    private var classCacheAccessOrder: [String] = []
+    /// Cache state protected by Mutex
+    private struct CacheState {
+        var classCache: [String: OntologyClass] = [:]
+        var classCacheAccessOrder: [String] = []
 
-    private var predicateCache: [String: OntologyPredicate] = [:]
-    private var predicateCacheAccessOrder: [String] = []
+        var predicateCache: [String: OntologyPredicate] = [:]
+        var predicateCacheAccessOrder: [String] = []
 
-    private var constraintCache: [String: [OntologyConstraint]] = [:]
-    private var constraintCacheAccessOrder: [String] = []
+        var constraintCache: [String: [OntologyConstraint]] = [:]
+        var constraintCacheAccessOrder: [String] = []
+    }
 
     private let classCacheLimit = 1000
     private let predicateCacheLimit = 5000
     private let constraintCacheLimit = 2000
+
+    /// Mutex-protected cache state
+    private let cache: Mutex<CacheState>
 
     // MARK: - Initialization
 
@@ -46,6 +45,7 @@ public actor OntologyStore {
         self.database = database
         self.rootPrefix = rootPrefix
         self.logger = logger ?? Logger(label: "com.ontology.store")
+        self.cache = Mutex(CacheState())
     }
 
     // MARK: - Class Management
@@ -147,11 +147,8 @@ public actor OntologyStore {
             transaction.clear(key: snippetKey)
         }
 
-        // Update cache
-        classCache[cls.name] = cls
-        if classCache.count > classCacheLimit {
-            evictOldestFromCache(&classCache, limit: classCacheLimit)
-        }
+        // Update cache with LRU
+        updateClassCache(cls)
 
         logger.debug("Class defined successfully", metadata: [
             "name": "\(cls.name)"
@@ -160,14 +157,21 @@ public actor OntologyStore {
 
     /// Retrieve a class definition by name
     public func getClass(named name: String) async throws -> OntologyClass? {
-        // Check cache
-        if let cached = classCache[name] {
-            // Update access order
-            if let index = classCacheAccessOrder.firstIndex(of: name) {
-                classCacheAccessOrder.remove(at: index)
+        // Check cache (with Mutex)
+        let cached = cache.withLock { state -> OntologyClass? in
+            guard let cls = state.classCache[name] else {
+                return nil
             }
-            classCacheAccessOrder.append(name)
-            return cached
+            // Update access order
+            if let index = state.classCacheAccessOrder.firstIndex(of: name) {
+                state.classCacheAccessOrder.remove(at: index)
+            }
+            state.classCacheAccessOrder.append(name)
+            return cls
+        }
+
+        if let cls = cached {
+            return cls
         }
 
         // Read from database
@@ -282,10 +286,12 @@ public actor OntologyStore {
             transaction.clear(key: snippetKey)
         }
 
-        // Remove from cache
-        classCache.removeValue(forKey: name)
-        if let index = classCacheAccessOrder.firstIndex(of: name) {
-            classCacheAccessOrder.remove(at: index)
+        // Remove from cache (with Mutex)
+        cache.withLock { state in
+            state.classCache.removeValue(forKey: name)
+            if let index = state.classCacheAccessOrder.firstIndex(of: name) {
+                state.classCacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.debug("Class deleted: \(name)")
@@ -404,25 +410,29 @@ public actor OntologyStore {
             transaction.setValue(TupleHelpers.encodeInt64(timestamp), for: tsKey)
         }
 
-        // Update cache
-        predicateCache[predicate.name] = predicate
-        if predicateCache.count > predicateCacheLimit {
-            evictOldestFromCache(&predicateCache, limit: predicateCacheLimit)
-        }
+        // Update cache with LRU
+        updatePredicateCache(predicate)
 
         logger.debug("Predicate defined: \(predicate.name)")
     }
 
     /// Retrieve a predicate definition by name
     public func getPredicate(named name: String) async throws -> OntologyPredicate? {
-        // Check cache
-        if let cached = predicateCache[name] {
-            // Update access order
-            if let index = predicateCacheAccessOrder.firstIndex(of: name) {
-                predicateCacheAccessOrder.remove(at: index)
+        // Check cache (with Mutex)
+        let cached = cache.withLock { state -> OntologyPredicate? in
+            guard let predicate = state.predicateCache[name] else {
+                return nil
             }
-            predicateCacheAccessOrder.append(name)
-            return cached
+            // Update access order
+            if let index = state.predicateCacheAccessOrder.firstIndex(of: name) {
+                state.predicateCacheAccessOrder.remove(at: index)
+            }
+            state.predicateCacheAccessOrder.append(name)
+            return predicate
+        }
+
+        if let predicate = cached {
+            return predicate
         }
 
         // Read from database
@@ -530,10 +540,12 @@ public actor OntologyStore {
             transaction.atomicOp(key: countKey, param: decrement, mutationType: .add)
         }
 
-        // Remove from cache
-        predicateCache.removeValue(forKey: name)
-        if let index = predicateCacheAccessOrder.firstIndex(of: name) {
-            predicateCacheAccessOrder.remove(at: index)
+        // Remove from cache (with Mutex)
+        cache.withLock { state in
+            state.predicateCache.removeValue(forKey: name)
+            if let index = state.predicateCacheAccessOrder.firstIndex(of: name) {
+                state.predicateCacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.debug("Predicate deleted: \(name)")
@@ -630,10 +642,12 @@ public actor OntologyStore {
             transaction.atomicOp(key: countKey, param: increment, mutationType: .add)
         }
 
-        // Invalidate cache for this predicate
-        constraintCache.removeValue(forKey: constraint.predicate)
-        if let index = constraintCacheAccessOrder.firstIndex(of: constraint.predicate) {
-            constraintCacheAccessOrder.remove(at: index)
+        // Invalidate cache for this predicate (with Mutex)
+        cache.withLock { state in
+            state.constraintCache.removeValue(forKey: constraint.predicate)
+            if let index = state.constraintCacheAccessOrder.firstIndex(of: constraint.predicate) {
+                state.constraintCacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.debug("Constraint defined: \(constraint.predicate)")
@@ -641,14 +655,21 @@ public actor OntologyStore {
 
     /// Retrieve all constraints for a predicate
     public func getConstraints(for predicateName: String) async throws -> [OntologyConstraint] {
-        // Check cache
-        if let cached = constraintCache[predicateName] {
-            // Update access order
-            if let index = constraintCacheAccessOrder.firstIndex(of: predicateName) {
-                constraintCacheAccessOrder.remove(at: index)
+        // Check cache (with Mutex)
+        let cached = cache.withLock { state -> [OntologyConstraint]? in
+            guard let constraints = state.constraintCache[predicateName] else {
+                return nil
             }
-            constraintCacheAccessOrder.append(predicateName)
-            return cached
+            // Update access order
+            if let index = state.constraintCacheAccessOrder.firstIndex(of: predicateName) {
+                state.constraintCacheAccessOrder.remove(at: index)
+            }
+            state.constraintCacheAccessOrder.append(predicateName)
+            return constraints
+        }
+
+        if let constraints = cached {
+            return constraints
         }
 
         // Read from database
@@ -674,19 +695,21 @@ public actor OntologyStore {
             return constraints
         }
 
-        // Update cache with LRU
-        constraintCache[predicateName] = constraints
+        // Update cache with LRU (with Mutex)
+        cache.withLock { state in
+            state.constraintCache[predicateName] = constraints
 
-        // Update access order
-        if let index = constraintCacheAccessOrder.firstIndex(of: predicateName) {
-            constraintCacheAccessOrder.remove(at: index)
-        }
-        constraintCacheAccessOrder.append(predicateName)
+            // Update access order
+            if let index = state.constraintCacheAccessOrder.firstIndex(of: predicateName) {
+                state.constraintCacheAccessOrder.remove(at: index)
+            }
+            state.constraintCacheAccessOrder.append(predicateName)
 
-        // Evict if over limit
-        if constraintCache.count > constraintCacheLimit {
-            let oldestKey = constraintCacheAccessOrder.removeFirst()
-            constraintCache.removeValue(forKey: oldestKey)
+            // Evict if over limit
+            if state.constraintCache.count > constraintCacheLimit {
+                let oldestKey = state.constraintCacheAccessOrder.removeFirst()
+                state.constraintCache.removeValue(forKey: oldestKey)
+            }
         }
 
         return constraints
@@ -714,10 +737,12 @@ public actor OntologyStore {
             transaction.atomicOp(key: countKey, param: decrement, mutationType: .add)
         }
 
-        // Invalidate cache
-        constraintCache.removeValue(forKey: predicate)
-        if let index = constraintCacheAccessOrder.firstIndex(of: predicate) {
-            constraintCacheAccessOrder.remove(at: index)
+        // Invalidate cache (with Mutex)
+        cache.withLock { state in
+            state.constraintCache.removeValue(forKey: predicate)
+            if let index = state.constraintCacheAccessOrder.firstIndex(of: predicate) {
+                state.constraintCacheAccessOrder.remove(at: index)
+            }
         }
 
         logger.debug("Constraint deleted")
@@ -726,53 +751,55 @@ public actor OntologyStore {
     // MARK: - Helper Methods
 
     private func updateClassCache(_ cls: OntologyClass) {
-        let key = cls.name
+        cache.withLock { state in
+            let key = cls.name
 
-        // Update or add to cache
-        if classCache[key] != nil {
-            // Already exists, update access order
-            if let index = classCacheAccessOrder.firstIndex(of: key) {
-                classCacheAccessOrder.remove(at: index)
-            }
-            classCacheAccessOrder.append(key)
-        } else {
-            // New entry
-            classCache[key] = cls
-            classCacheAccessOrder.append(key)
+            // Update or add to cache
+            if state.classCache[key] != nil {
+                // Already exists, update access order
+                if let index = state.classCacheAccessOrder.firstIndex(of: key) {
+                    state.classCacheAccessOrder.remove(at: index)
+                }
+                state.classCacheAccessOrder.append(key)
+                state.classCache[key] = cls  // Update value
+            } else {
+                // New entry
+                state.classCache[key] = cls
+                state.classCacheAccessOrder.append(key)
 
-            // Evict if over limit
-            if classCache.count > classCacheLimit {
-                let oldestKey = classCacheAccessOrder.removeFirst()
-                classCache.removeValue(forKey: oldestKey)
+                // Evict if over limit
+                if state.classCache.count > classCacheLimit {
+                    let oldestKey = state.classCacheAccessOrder.removeFirst()
+                    state.classCache.removeValue(forKey: oldestKey)
+                }
             }
         }
-
-        classCache[key] = cls
     }
 
     private func updatePredicateCache(_ predicate: OntologyPredicate) {
-        let key = predicate.name
+        cache.withLock { state in
+            let key = predicate.name
 
-        // Update or add to cache
-        if predicateCache[key] != nil {
-            // Already exists, update access order
-            if let index = predicateCacheAccessOrder.firstIndex(of: key) {
-                predicateCacheAccessOrder.remove(at: index)
-            }
-            predicateCacheAccessOrder.append(key)
-        } else {
-            // New entry
-            predicateCache[key] = predicate
-            predicateCacheAccessOrder.append(key)
+            // Update or add to cache
+            if state.predicateCache[key] != nil {
+                // Already exists, update access order
+                if let index = state.predicateCacheAccessOrder.firstIndex(of: key) {
+                    state.predicateCacheAccessOrder.remove(at: index)
+                }
+                state.predicateCacheAccessOrder.append(key)
+                state.predicateCache[key] = predicate  // Update value
+            } else {
+                // New entry
+                state.predicateCache[key] = predicate
+                state.predicateCacheAccessOrder.append(key)
 
-            // Evict if over limit
-            if predicateCache.count > predicateCacheLimit {
-                let oldestKey = predicateCacheAccessOrder.removeFirst()
-                predicateCache.removeValue(forKey: oldestKey)
+                // Evict if over limit
+                if state.predicateCache.count > predicateCacheLimit {
+                    let oldestKey = state.predicateCacheAccessOrder.removeFirst()
+                    state.predicateCache.removeValue(forKey: oldestKey)
+                }
             }
         }
-
-        predicateCache[key] = predicate
     }
 
     // MARK: - Validation Helpers

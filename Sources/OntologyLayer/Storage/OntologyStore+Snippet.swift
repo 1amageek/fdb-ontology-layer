@@ -61,15 +61,13 @@ extension OntologyStore {
             examples = examplesStr.components(separatedBy: ",").map { $0.trimmingCharacters(in: .whitespaces) }
         }
 
-        var snippet = OntologySnippet(
+        return OntologySnippet(
             className: cls.name,
             description: cls.description ?? "No description",
             parent: cls.parent,
             predicates: predicateDescriptions,
             examples: examples
         )
-
-        return snippet
     }
 
     private func getCachedSnippet(for className: String) async throws -> String? {
